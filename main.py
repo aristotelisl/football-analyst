@@ -1,40 +1,70 @@
 import os
+import time
 import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Config ---
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-BOOKMAKER_KEY = "paddypower"  # Paddy Power's key in The Odds API
-MIN_EDGE = 0.03  # minimum edge to alert (3%) — tune this up/down
+BOOKMAKER_KEY = "paddypower"
+MIN_EDGE = 0.03
 
-LEAGUES = [
-    "soccer_epl",
-    "soccer_spain_la_liga",
-    "soccer_italy_serie_a",
-    "soccer_germany_bundesliga",
-    "soccer_france_ligue_one",
-    "soccer_uefa_champs_league",
-    "soccer_fifa_world_cup",
-]
+LEAGUES = {
+    "worldcup": "soccer_fifa_world_cup",
+    "epl": "soccer_epl",
+    "laliga": "soccer_spain_la_liga",
+    "seriea": "soccer_italy_serie_a",
+    "bundesliga": "soccer_germany_bundesliga",
+    "ligue1": "soccer_france_ligue_one",
+    "ucl": "soccer_uefa_champs_league",
+}
+
+HELP_TEXT = """
+⚽ <b>Football Value Bet Scanner</b>
+━━━━━━━━━━━━━━━━━━
+Available commands:
+
+/worldcup — Today's World Cup matches
+/epl — Premier League
+/laliga — La Liga
+/seriea — Serie A
+/bundesliga — Bundesliga
+/ligue1 — Ligue 1
+/ucl — Champions League
+/all — All leagues
+
+Sends value bets where Paddy Power odds are better than the market average.
+""".strip()
 
 
-# --- Telegram ---
-def send_telegram(message: str):
+# --- Telegram API ---
+def get_updates(offset=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"timeout": 30, "offset": offset}
+    try:
+        response = requests.get(url, params=params, timeout=35)
+        return response.json().get("result", [])
+    except Exception as e:
+        print(f"Error getting updates: {e}")
+        return []
+
+
+def send_message(chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-    }
-    response = requests.post(url, json=payload)
-    if not response.ok:
-        print(f"Telegram error: {response.text}")
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Error sending message: {e}")
+
+
+def send_typing(chat_id: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendChatAction"
+    requests.post(url, json={"chat_id": chat_id, "action": "typing"})
 
 
 # --- Odds API ---
@@ -43,7 +73,7 @@ def fetch_odds(sport: str):
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
-        "markets": "h2h",  # head-to-head (1X2)
+        "markets": "h2h",
         "oddsFormat": "decimal",
         "bookmakers": "paddypower,bet365,williamhill,unibet,betfair,marathonbet,pinnacle",
     }
@@ -53,13 +83,21 @@ def fetch_odds(sport: str):
         print(f"  ✓ {sport} — {len(response.json())} matches | Requests remaining: {remaining}")
         return response.json()
     else:
-        print(f"  ✗ {sport} — API error {response.status_code}: {response.text}")
+        print(f"  ✗ {sport} error {response.status_code}")
         return []
 
 
-# --- Core Logic ---
+def is_today(commence_time: str) -> bool:
+    try:
+        dt = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+        today = datetime.now(timezone.utc).date()
+        return dt.date() == today
+    except Exception:
+        return False
+
+
+# --- Analysis ---
 def get_market_average(bookmakers: list, outcome_name: str) -> float:
-    """Calculate average odds for an outcome across all bookmakers (excluding Paddy Power)."""
     prices = []
     for bm in bookmakers:
         if bm["key"] == BOOKMAKER_KEY:
@@ -69,13 +107,10 @@ def get_market_average(bookmakers: list, outcome_name: str) -> float:
                 for outcome in market["outcomes"]:
                     if outcome["name"] == outcome_name:
                         prices.append(outcome["price"])
-    if not prices:
-        return None
-    return sum(prices) / len(prices)
+    return sum(prices) / len(prices) if prices else None
 
 
 def get_paddy_power_odds(bookmakers: list) -> dict:
-    """Extract Paddy Power's odds for each outcome."""
     for bm in bookmakers:
         if bm["key"] == BOOKMAKER_KEY:
             for market in bm.get("markets", []):
@@ -85,20 +120,16 @@ def get_paddy_power_odds(bookmakers: list) -> dict:
 
 
 def analyze_match(match: dict) -> list:
-    """Compare Paddy Power odds vs market average. Return value bets found."""
     value_bets = []
-
+    bookmakers = match.get("bookmakers", [])
     home = match["home_team"]
     away = match["away_team"]
-    bookmakers = match.get("bookmakers", [])
 
     pp_odds = get_paddy_power_odds(bookmakers)
     if not pp_odds:
-        return []  # Paddy Power not covering this match
+        return []
 
-    outcomes = [home, away, "Draw"]
-
-    for outcome in outcomes:
+    for outcome in [home, away, "Draw"]:
         pp_price = pp_odds.get(outcome)
         if not pp_price:
             continue
@@ -107,11 +138,8 @@ def analyze_match(match: dict) -> list:
         if not market_avg:
             continue
 
-        # implied probabilities
         pp_implied = 1 / pp_price
         market_implied = 1 / market_avg
-
-        # edge = how much better PP is vs the market
         edge = market_implied - pp_implied
 
         if edge >= MIN_EDGE:
@@ -119,7 +147,7 @@ def analyze_match(match: dict) -> list:
                 "outcome": outcome,
                 "pp_odds": pp_price,
                 "market_avg_odds": round(market_avg, 3),
-                "edge": round(edge * 100, 2),  # as percentage
+                "edge": round(edge * 100, 2),
                 "pp_implied_prob": round(pp_implied * 100, 1),
                 "market_implied_prob": round(market_implied * 100, 1),
             })
@@ -127,70 +155,124 @@ def analyze_match(match: dict) -> list:
     return value_bets
 
 
-def format_alert(match: dict, value_bets: list) -> str:
+def format_match(match: dict, value_bets: list) -> str:
     home = match["home_team"]
     away = match["away_team"]
-    kickoff_utc = match.get("commence_time", "")
 
-    # parse and format kickoff time
     try:
-        dt = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00"))
-        kickoff_str = dt.strftime("%d %b %Y %H:%M UTC")
+        dt = datetime.fromisoformat(match["commence_time"].replace("Z", "+00:00"))
+        kickoff_str = dt.strftime("%H:%M UTC")
     except Exception:
-        kickoff_str = kickoff_utc
+        kickoff_str = "?"
 
-    lines = [
-        f"🟢 <b>VALUE BET DETECTED</b>",
-        f"━━━━━━━━━━━━━━━━━━",
-        f"⚽ <b>{home} vs {away}</b>",
-        f"🕐 Kickoff: {kickoff_str}",
-        f"",
-    ]
+    lines = [f"⚽ <b>{home} vs {away}</b> — {kickoff_str}"]
 
-    for vb in value_bets:
-        lines += [
-            f"💡 <b>Bet: {vb['outcome']}</b>",
-            f"   Paddy Power odds: <b>{vb['pp_odds']}</b>",
-            f"   Market average:   {vb['market_avg_odds']}",
-            f"   Edge: <b>+{vb['edge']}%</b>",
-            f"   PP implied prob:  {vb['pp_implied_prob']}%",
-            f"   Market consensus: {vb['market_implied_prob']}%",
-            f"",
-        ]
+    if value_bets:
+        for vb in value_bets:
+            lines.append(
+                f"  🟢 <b>{vb['outcome']}</b> @ {vb['pp_odds']} "
+                f"(market avg: {vb['market_avg_odds']} | edge: +{vb['edge']}%)"
+            )
+    else:
+        pp_odds = get_paddy_power_odds(match.get("bookmakers", []))
+        if pp_odds:
+            odds_str = " | ".join([f"{k}: {v}" for k, v in pp_odds.items()])
+            lines.append(f"  ℹ️ No value found — PP odds: {odds_str}")
+        else:
+            lines.append(f"  ⚪ Paddy Power not covering this match")
 
-    lines.append("⚠️ Bet responsibly. This is analysis only.")
     return "\n".join(lines)
 
 
-# --- Main ---
-def run():
-    print(f"\n🔍 Football Value Bet Scanner — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("=" * 50)
+# --- Command Handler ---
+def handle_command(chat_id: str, command: str):
+    command = command.lower().split("@")[0]
 
+    if command in ("/start", "/help"):
+        send_message(chat_id, HELP_TEXT)
+        return
+
+    if command == "/all":
+        leagues_to_scan = list(LEAGUES.items())
+    elif command.lstrip("/") in LEAGUES:
+        key = command.lstrip("/")
+        leagues_to_scan = [(key, LEAGUES[key])]
+    else:
+        send_message(chat_id, "Unknown command. Send /help to see available commands.")
+        return
+
+    send_typing(chat_id)
+    send_message(chat_id, "🔍 Scanning today's matches... hang on.")
+
+    today = datetime.now(timezone.utc).strftime("%d %b %Y")
+    results = []
     total_matches = 0
-    total_value_bets = 0
+    value_bet_count = 0
 
-    for league in LEAGUES:
-        print(f"\n📋 Checking {league}...")
-        matches = fetch_odds(league)
+    for league_name, league_key in leagues_to_scan:
+        matches = fetch_odds(league_key)
+        today_matches = [m for m in matches if is_today(m.get("commence_time", ""))]
 
-        for match in matches:
+        if not today_matches:
+            continue
+
+        section_lines = [f"\n🏆 <b>{league_name.upper()}</b>"]
+
+        for match in today_matches:
             total_matches += 1
             value_bets = analyze_match(match)
+            value_bet_count += len(value_bets)
+            section_lines.append(format_match(match, value_bets))
 
-            if value_bets:
-                total_value_bets += len(value_bets)
-                alert = format_alert(match, value_bets)
-                print(f"\n  🟢 Value bet found: {match['home_team']} vs {match['away_team']}")
-                send_telegram(alert)
+        results.append("\n".join(section_lines))
+
+    if not results:
+        send_message(chat_id, f"📭 No matches found today ({today}) for the selected league(s).")
+        return
+
+    header = f"📊 <b>Today's Analysis — {today}</b>\n━━━━━━━━━━━━━━━━━━"
+    send_message(chat_id, header)
+
+    for section in results:
+        send_message(chat_id, section)
 
     summary = (
-        f"✅ Scan complete — {datetime.now().strftime('%H:%M UTC')}\n"
-        f"Matches checked: {total_matches}\n"
-        f"Value bets found: {total_value_bets}"
+        f"\n✅ <b>Scan complete</b>\n"
+        f"Matches today: {total_matches}\n"
+        f"Value bets found: {value_bet_count}\n"
+        f"⚠️ Always bet responsibly."
     )
-    print(f"\n{summary}")
-    send_telegram(f"📊 {summary}")
+    send_message(chat_id, summary)
+
+
+# --- Main Loop ---
+def run():
+    print("🤖 Bot started — waiting for messages...")
+    send_message(TELEGRAM_CHAT_ID, "🤖 Football analyst bot is online! Send /help to get started.")
+
+    offset = None
+
+    while True:
+        updates = get_updates(offset)
+
+        for update in updates:
+            offset = update["update_id"] + 1
+            message = update.get("message", {})
+            text = message.get("text", "")
+            chat_id = str(message.get("chat", {}).get("id", ""))
+
+            if not text or not chat_id:
+                continue
+
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                print(f"Ignored message from unknown chat: {chat_id}")
+                continue
+
+            if text.startswith("/"):
+                print(f"Command received: {text}")
+                handle_command(chat_id, text)
+
+        time.sleep(1)
 
 
 if __name__ == "__main__":

@@ -1,13 +1,14 @@
-name: Football Value Bet Scanner
+name: Football Analyst Bot
 
 on:
-  schedule:
-    - cron: '0 * * * *'  # runs every hour
-  workflow_dispatch:       # allows manual trigger from GitHub UI
+  workflow_dispatch:  # manual start from GitHub UI
+  push:
+    branches: [main]  # auto-restarts when you push new code
 
 jobs:
-  scan:
+  run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 350  # GitHub Actions max is 6hrs, restart manually as needed
 
     steps:
       - name: Checkout code
@@ -21,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scanner
+      - name: Run bot
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
